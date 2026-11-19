@@ -22,6 +22,13 @@ SSM Parameter Store: X-API-Key (SecureString) · CloudWatch Logs (7 days) + erro
 An optional `cloudfront` mode puts CloudFront in front (private S3 for the page, IAM-only Function URL signed by
 CloudFront OAC, security headers). See *Two edge modes* below.
 
+## Screenshot
+
+The live app on AWS (Lambda Function URL, us-east-2): the agent looks up SKU002 in DynamoDB, runs the
+reorder calculator and recommends ordering 55 units.
+
+![Inventory Planning Agent answering "Should I reorder SKU002?" on AWS Lambda](docs/evidence/live-chat.webp)
+
 ## What is different from the Fargate version
 
 | Concern | Fargate edition | This edition |
@@ -95,6 +102,7 @@ From `docs/evidence/`:
   (SKU002: reorder point 55, order 55 units). The Lambda signed its own Bedrock token, so no Bedrock key is stored anywhere.
 * `lambda-report-lines.txt`: cold start 2.9 s init, warm requests 15-95 ms, chat turn 1.5 s, peak memory 218 MB.
 * `stack-resources.txt`: 10 resources: Lambda + URL, IAM role, 2 DynamoDB tables, log group, alarm, budget, 2 permissions.
+* `live-chat.webp`: the chat UI answering "Should I reorder SKU002?" against the live deployment.
 * CloudWatch: 0 errors.
 
 ## Notes
