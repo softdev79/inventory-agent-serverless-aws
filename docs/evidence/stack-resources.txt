@@ -1,0 +1,10 @@
+AWS::CloudWatch::Alarm	ApiErrorsAlarm
+AWS::Lambda::Function	ApiFunction
+AWS::IAM::Role	ApiFunctionRole
+AWS::Lambda::Url	ApiFunctionUrl
+AWS::Logs::LogGroup	ApiLogGroup
+AWS::DynamoDB::Table	InventoryTable
+AWS::Budgets::Budget	MonthlyBudget
+AWS::Lambda::Permission	PublicInvokeFunction
+AWS::Lambda::Permission	PublicInvokeUrl
+AWS::DynamoDB::Table	SessionsTable

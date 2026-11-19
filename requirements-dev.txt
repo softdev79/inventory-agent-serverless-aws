@@ -1,0 +1,8 @@
+-r backend/requirements.txt
+boto3
+botocore[crt]   # lets boto3 use `aws login` sessions
+uvicorn>=0.38
+pytest
+httpx
+moto[dynamodb,ssm]>=5
+openai

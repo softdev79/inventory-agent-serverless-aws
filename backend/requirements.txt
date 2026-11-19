@@ -1,0 +1,7 @@
+# Lambda runtime deps (boto3/botocore are provided by the python3.13 runtime)
+fastapi>=0.120,<1
+mangum>=0.19,<1
+langchain>=1.5,<2
+langchain-openai>=1.8,<2
+aws-bedrock-token-generator>=1.1,<2
+python-dotenv>=1.0,<2

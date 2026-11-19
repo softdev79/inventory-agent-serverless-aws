@@ -1,0 +1,7 @@
+.env
+.venv/
+build/
+build-packaged.yaml
+__pycache__/
+.pytest_cache/
+.idea/

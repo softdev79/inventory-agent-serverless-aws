@@ -1,0 +1,26 @@
+REPORT 
+Duration: 314.72 ms
+Billed Duration: 3180 ms
+Memory Size: 1024 MB
+Max Memory Used: 204 MB
+Init Duration: 2865.10 ms
+REPORT 
+Duration: 14.60 ms
+Billed Duration: 15 ms
+Memory Size: 1024 MB
+Max Memory Used: 204 MB
+REPORT 
+Duration: 94.68 ms
+Billed Duration: 95 ms
+Memory Size: 1024 MB
+Max Memory Used: 209 MB
+REPORT 
+Duration: 16.99 ms
+Billed Duration: 17 ms
+Memory Size: 1024 MB
+Max Memory Used: 209 MB
+REPORT 
+Duration: 1479.95 ms
+Billed Duration: 1480 ms
+Memory Size: 1024 MB
+Max Memory Used: 218 MB

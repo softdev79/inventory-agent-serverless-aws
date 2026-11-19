@@ -1,0 +1,334 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Inventory Planning Agent (serverless). CloudFront -> S3 (static UI) and Lambda Function URL (FastAPI +
+  LangChain agent) -> Bedrock OpenAI-compatible endpoint + DynamoDB. $0 when idle.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: inventory-agent
+    AllowedPattern: "[a-z0-9-]{3,30}"
+  ModelId:
+    Type: String
+    Default: openai.gpt-oss-120b
+  BedrockProjectId:
+    Type: String
+    Default: ""
+    Description: Bedrock (Mantle) project id sent as the OpenAI-Project header. Empty = default project.
+  ApiKeyParam:
+    Type: String
+    Default: /inventory-agent/api-key
+    Description: SSM SecureString parameter that holds the X-API-Key value (created by deploy.ps1).
+  ReservedConcurrency:
+    Type: Number
+    Default: 0
+    Description: Cap on concurrent Lambdas (cost guard). 0 = no cap (needed on new accounts whose limit is 10).
+  BudgetEmail:
+    Type: String
+    Default: ""
+    Description: Email for AWS Budgets alerts. Empty = no budget.
+  BudgetUsd:
+    Type: Number
+    Default: 5
+  EdgeMode:
+    Type: String
+    Default: function-url
+    AllowedValues: [cloudfront, function-url]
+    Description: >
+      cloudfront = CloudFront + private S3 UI + IAM-only Function URL (recommended).
+      function-url = Lambda serves UI and API on a public Function URL (for accounts where CloudFront
+      is not yet enabled; /api/* still requires X-API-Key).
+
+Conditions:
+  HasReservedConcurrency: !Not [!Equals [!Ref ReservedConcurrency, 0]]
+  HasBudget: !Not [!Equals [!Ref BudgetEmail, ""]]
+  UseCloudFront: !Equals [!Ref EdgeMode, cloudfront]
+  DirectUrl: !Equals [!Ref EdgeMode, function-url]
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures: [arm64]
+
+Resources:
+  # ---------------------------------------------------------------- data
+  InventoryTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      TableName: !Sub "${AppName}-inventory"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: sku_id, AttributeType: S }]
+      KeySchema: [{ AttributeName: sku_id, KeyType: HASH }]
+
+  SessionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      TableName: !Sub "${AppName}-sessions"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: session_id, AttributeType: S }
+        - { AttributeName: ts, AttributeType: S }
+      KeySchema:
+        - { AttributeName: session_id, KeyType: HASH }
+        - { AttributeName: ts, KeyType: RANGE }
+      TimeToLiveSpecification: { AttributeName: expires_at, Enabled: true }
+
+  # ---------------------------------------------------------------- API (Lambda)
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-api"
+      RetentionInDays: 7
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ApiLogGroup
+    Properties:
+      FunctionName: !Sub "${AppName}-api"
+      CodeUri: build/
+      Handler: api.handler
+      MemorySize: 1024
+      Timeout: 60
+      ReservedConcurrentExecutions: !If [HasReservedConcurrency, !Ref ReservedConcurrency, !Ref AWS::NoValue]
+      Environment:
+        Variables:
+          OPENAI_MODEL: !Ref ModelId
+          OPENAI_BASE_URL: !Sub "https://bedrock-mantle.${AWS::Region}.api.aws/v1"
+          OPENAI_PROJECT_ID: !Ref BedrockProjectId
+          INVENTORY_TABLE: !Ref InventoryTable
+          SESSIONS_TABLE: !Ref SessionsTable
+          API_KEY_PARAM: !Ref ApiKeyParam
+          SERVE_UI: !If [DirectUrl, "true", "false"]
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref InventoryTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref SessionsTable }
+        - Statement:
+            - Sid: ReadApiKey
+              Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ApiKeyParam}"
+            - Sid: DecryptApiKey      # SecureString with the AWS-managed key
+              Effect: Allow
+              Action: kms:Decrypt
+              Resource: "*"
+              Condition:
+                StringEquals: { "kms:ViaService": !Sub "ssm.${AWS::Region}.amazonaws.com" }
+            - Sid: BedrockShortTermToken   # role-signed bearer token, no long-lived key
+              Effect: Allow
+              Action:
+                - bedrock:CallWithBearerToken
+                - bedrock-mantle:CallWithBearerToken
+              Resource: "*"
+            - Sid: BedrockMantleInference
+              Effect: Allow
+              Action:
+                - bedrock-mantle:CreateInference
+                - bedrock-mantle:GetInference
+                - bedrock-mantle:CountTokens
+                - bedrock-mantle:GetModel
+                - bedrock-mantle:ListModels
+              Resource: !Sub "arn:${AWS::Partition}:bedrock-mantle:${AWS::Region}:${AWS::AccountId}:project/*"
+
+  ApiFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt ApiFunction.Arn
+      AuthType: !If [UseCloudFront, AWS_IAM, NONE]   # AWS_IAM: only CloudFront (OAC-signed) can call it
+
+  # function-url mode: anyone may reach the URL; the app itself enforces X-API-Key on /api/*.
+  PublicInvokeUrl:
+    Type: AWS::Lambda::Permission
+    Condition: DirectUrl
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  PublicInvokeFunction:
+    Type: AWS::Lambda::Permission
+    Condition: DirectUrl
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+  # ---------------------------------------------------------------- static UI (cloudfront mode)
+  UiBucket:
+    Type: AWS::S3::Bucket
+    Condition: UseCloudFront
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "${AppName}-ui-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+
+  UiBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: UseCloudFront
+    Properties:
+      Bucket: !Ref UiBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudFrontReadOnly
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${UiBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+  # ---------------------------------------------------------------- CloudFront
+  S3Oac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Condition: UseCloudFront
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AppName}-s3-${AWS::Region}"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  LambdaOac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Condition: UseCloudFront
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AppName}-lambda-${AWS::Region}"
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SecurityHeaders:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Condition: UseCloudFront
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub "${AppName}-security-${AWS::Region}"
+        SecurityHeadersConfig:
+          ContentTypeOptions: { Override: true }
+          FrameOptions: { FrameOption: DENY, Override: true }
+          ReferrerPolicy: { ReferrerPolicy: same-origin, Override: true }
+          StrictTransportSecurity: { AccessControlMaxAgeSec: 31536000, Override: true }
+          ContentSecurityPolicy:
+            ContentSecurityPolicy: "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'"
+            Override: true
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: UseCloudFront
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AppName} UI + API"
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        DefaultRootObject: index.html
+        Origins:
+          - Id: ui
+            DomainName: !GetAtt UiBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt S3Oac.Id
+            S3OriginConfig: { OriginAccessIdentity: "" }
+          - Id: api
+            DomainName: !Select [2, !Split ["/", !GetAtt ApiFunctionUrl.FunctionUrl]]
+            OriginAccessControlId: !GetAtt LambdaOac.Id
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: 60
+        DefaultCacheBehavior:
+          TargetOriginId: ui
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6          # Managed-CachingOptimized
+          ResponseHeadersPolicyId: !Ref SecurityHeaders
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad        # Managed-CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # Managed-AllViewerExceptHostHeader
+            ResponseHeadersPolicyId: !Ref SecurityHeaders
+
+  # CloudFront (this distribution only) may invoke the function URL.
+  CloudFrontInvokeUrl:
+    Type: AWS::Lambda::Permission
+    Condition: UseCloudFront
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: cloudfront.amazonaws.com
+      FunctionUrlAuthType: AWS_IAM
+      SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+  CloudFrontInvokeFunction:
+    Type: AWS::Lambda::Permission
+    Condition: UseCloudFront
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+  # ---------------------------------------------------------------- ops
+  ApiErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AppName}-api-errors"
+      AlarmDescription: Lambda errors in the inventory agent API
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref ApiFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Condition: HasBudget
+    Properties:
+      Budget:
+        BudgetName: !Sub "${AppName}-monthly"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: !Ref BudgetUsd, Unit: USD }
+      NotificationsWithSubscribers:
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 20, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref BudgetEmail }]
+        - Notification: { NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 80, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref BudgetEmail }]
+
+Outputs:
+  AppUrl:
+    Description: Open this in a browser
+    Value: !If [UseCloudFront, !Sub "https://${Distribution.DomainName}", !GetAtt ApiFunctionUrl.FunctionUrl]
+  EdgeMode:
+    Value: !Ref EdgeMode
+  DistributionId:
+    Condition: UseCloudFront
+    Value: !Ref Distribution
+  UiBucketName:
+    Condition: UseCloudFront
+    Value: !Ref UiBucket
+  FunctionName:
+    Value: !Ref ApiFunction
+  InventoryTableName:
+    Value: !Ref InventoryTable

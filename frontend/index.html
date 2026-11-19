@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inventory Planning Agent</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c2430; --muted:#5d6b7e; --line:#dfe3ea; --accent:#2457d6; --user:#e8efff; --err:#b42318; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0f1318; --card:#171c23; --text:#e6eaf0; --muted:#97a3b4; --line:#2a313b; --accent:#6d93ff; --user:#1f2a44; --err:#ff8a7a; } }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:14px 16px; border-bottom:1px solid var(--line); background:var(--card); display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:0; flex:1; min-width:200px; }
+  header small { color:var(--muted); }
+  main { max-width:1100px; margin:0 auto; padding:16px; display:grid; grid-template-columns:1fr 300px; gap:16px; }
+  @media (max-width:800px) { main { grid-template-columns:1fr; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  #log { height:min(60vh,560px); overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding-right:4px; }
+  .msg { padding:10px 12px; border-radius:10px; max-width:88%; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .user { background:var(--user); align-self:flex-end; }
+  .bot { border:1px solid var(--line); align-self:flex-start; }
+  .bot.err { color:var(--err); }
+  .meta { font-size:12px; color:var(--muted); margin-top:4px; }
+  form { display:flex; gap:8px; margin-top:12px; }
+  input, button { font:inherit; padding:9px 11px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--text); }
+  input { flex:1; min-width:0; }
+  button { background:var(--accent); border-color:var(--accent); color:#fff; cursor:pointer; }
+  button:disabled { opacity:.6; cursor:wait; }
+  label { display:block; font-size:13px; color:var(--muted); margin:10px 0 4px; }
+  .row { display:flex; gap:8px; }
+  table { width:100%; border-collapse:collapse; font-size:14px; margin-top:8px; }
+  td { padding:4px 0; border-bottom:1px solid var(--line); }
+  td:last-child { text-align:right; font-variant-numeric:tabular-nums; }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .chip { font-size:13px; padding:5px 9px; background:transparent; color:var(--accent); border:1px solid var(--line); }
+  h2 { font-size:15px; margin:0 0 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Inventory Planning Agent <small>· Lambda + DynamoDB + Bedrock</small></h1>
+  <input id="apikey" type="password" placeholder="API key" autocomplete="off" style="max-width:220px">
+</header>
+<main>
+  <section class="card">
+    <div id="log" aria-live="polite"></div>
+    <div class="chips">
+      <button class="chip" type="button">Should I reorder SKU002?</button>
+      <button class="chip" type="button">How many days until SKU003 hits its reorder point?</button>
+      <button class="chip" type="button">I have 300 units, sell 25/day, lead time 9 days, safety stock 50. Reorder?</button>
+    </div>
+    <form id="chatform">
+      <input id="q" placeholder="Ask about a SKU or give your own numbers…" autocomplete="off" maxlength="2000">
+      <button id="send">Send</button>
+    </form>
+  </section>
+  <aside class="card">
+    <h2>SKU lookup</h2>
+    <div class="row"><input id="sku" placeholder="SKU001"><button id="lookup" type="button">Look up</button></div>
+    <div id="skuout"></div>
+    <label>Sample SKUs: SKU001, SKU002, SKU003</label>
+  </aside>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const store = { get(k){ try { return sessionStorage.getItem(k); } catch { return null; } },
+                set(k,v){ try { sessionStorage.setItem(k,v); } catch {} } };
+let history = [];
+let sessionId = null;
+$("apikey").value = store.get("apikey") || "";
+$("apikey").addEventListener("change", () => store.set("apikey", $("apikey").value.trim()));
+
+async function sha256Hex(text) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// CloudFront OAC signs requests to the Lambda Function URL; for bodies it needs the payload hash.
+async function api(path, { method = "GET", body } = {}) {
+  const headers = { "X-API-Key": $("apikey").value.trim() };
+  let payload;
+  if (body !== undefined) {
+    payload = JSON.stringify(body);
+    headers["Content-Type"] = "application/json";
+    headers["x-amz-content-sha256"] = await sha256Hex(payload);
+  }
+  const res = await fetch("/api" + path, { method, headers, body: payload });
+  const text = await res.text();
+  let data; try { data = JSON.parse(text); } catch { data = { detail: text }; }
+  if (!res.ok) throw new Error(`${res.status}: ${data.detail || data.message || text}`);
+  return data;
+}
+
+function add(role, text, meta, isErr) {
+  const div = document.createElement("div");
+  div.className = "msg " + (role === "user" ? "user" : "bot") + (isErr ? " err" : "");
+  div.textContent = text;
+  if (meta) { const m = document.createElement("div"); m.className = "meta"; m.textContent = meta; div.appendChild(m); }
+  $("log").appendChild(div);
+  $("log").scrollTop = $("log").scrollHeight;
+  return div;
+}
+
+async function ask(q) {
+  if (!q) return;
+  if (!$("apikey").value.trim()) { add("bot", "Enter the API key in the top-right box first.", null, true); return; }
+  add("user", q);
+  $("q").value = ""; $("send").disabled = true;
+  const pending = add("bot", "Thinking…");
+  const t0 = performance.now();
+  try {
+    const r = await api("/chat", { method: "POST", body: { query: q, session_id: sessionId, history } });
+    sessionId = r.session_id;
+    history.push({ role: "user", content: q }, { role: "assistant", content: r.response });
+    history = history.slice(-20);
+    pending.remove();
+    add("bot", r.response.replace(/\*\*(.+?)\*\*/g, "$1"), `${((performance.now() - t0) / 1000).toFixed(1)} s`);
+  } catch (e) {
+    pending.remove(); add("bot", e.message, null, true);
+  } finally { $("send").disabled = false; $("q").focus(); }
+}
+
+$("chatform").addEventListener("submit", (e) => { e.preventDefault(); ask($("q").value.trim()); });
+document.querySelectorAll(".chip").forEach(b => b.addEventListener("click", () => ask(b.textContent)));
+
+$("lookup").addEventListener("click", async () => {
+  const sku = $("sku").value.trim().toUpperCase();
+  const out = $("skuout"); out.textContent = "";
+  if (!sku) return;
+  try {
+    const r = await api("/inventory/" + encodeURIComponent(sku));
+    const t = document.createElement("table");
+    [["Name", r.name], ["On hand", r.current_inventory], ["Avg demand / day", r.avg_demand],
+     ["Lead time (days)", r.lead_time], ["Safety stock", r.safety_stock]].forEach(([k, v]) => {
+      const tr = t.insertRow(); tr.insertCell().textContent = k; tr.insertCell().textContent = v;
+    });
+    out.appendChild(t);
+  } catch (e) { out.textContent = e.message; out.style.color = "var(--err)"; }
+});
+
+add("bot", "Hi! Ask me whether to reorder a SKU (try SKU001–SKU003) or give me your own stock, demand and lead time.");
+</script>
+</body>
+</html>
